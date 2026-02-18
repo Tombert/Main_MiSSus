@@ -1040,8 +1040,7 @@ static void create_save_path(char* save_path, const MemoryType type) {
 
 static void mount_save_core(const char* save_path, const MemoryType type, const char* old_path) {
 	auto save_file = new N64SaveFile(type);
-	if (user_io_sqlite_sram_only()) save_file->mount(save_path);
-	else save_file->mount(save_path, old_path);
+	save_file->mount(save_path, old_path);
 }
 
 static void mount_save(const MemoryType type, const char* old_path) {
@@ -1116,11 +1115,6 @@ static void mount_save_gb(const char* old_path) {
 	}
 
 	auto save_file = new N64SaveFile(MemoryType::TPAK);
-	if (user_io_sqlite_sram_only()) {
-		save_file->mount(save_path);
-		return;
-	}
-
 	if (!FileExists(save_path)) {
 		create_path(SAVE_DIR, core_name);
 		if (!save_file->copy_file(tpak_path, save_path, true, true)) {
@@ -1237,7 +1231,6 @@ static void write_save_file(const uint64_t sector_index, const uint32_t sector_s
 			menu_process_save();
 			FileSeek(img, file_offset, SEEK_SET);
 			FileWriteAdv(img, buffer, chunk_size);
-			user_io_mark_save_dirty(file_index);
 		}
 
 		// Log success if we hit the end of the file.

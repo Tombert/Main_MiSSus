@@ -99,7 +99,8 @@ typedef struct {
 	uint16_t osd_lock_time;
 	char debug;
 	uint8_t lookahead;
-	uint32_t sram_autosave_interval;
+	uint8_t sqlite_sram_enable;
+	uint32_t sqlite_sram_autosave_interval;
 	char main[1024];
 	char vfilter_interlace_default[1023];
 	char autofire_rates[256];

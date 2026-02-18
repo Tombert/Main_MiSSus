@@ -9,7 +9,6 @@
 #include <ctype.h>
 #include <sys/stat.h>
 #include <sys/statvfs.h>
-#include <vector>
 
 #include "lib/imlib2/Imlib2.h"
 
@@ -39,10 +38,7 @@
 #include "profiling.h"
 
 #include "support.h"
-
-#if SQLITE_SRAM_SNAPSHOTS
-#include <sqlite3.h>
-#endif
+#include "support/sram_store/sram_store.h"
 
 static char core_path[1024] = {};
 static char rbf_path[1024] = {};
@@ -61,820 +57,6 @@ static uint64_t buffer_lba[16] = { ULLONG_MAX,ULLONG_MAX,ULLONG_MAX,ULLONG_MAX,
 								   ULLONG_MAX,ULLONG_MAX,ULLONG_MAX,ULLONG_MAX };
 
 static int use_save = 0;
-
-#define SRAM_SNAPSHOT_MAX_SLOTS      16
-#define SRAM_SNAPSHOT_HISTORY_LIMIT  50
-#define SRAM_SNAPSHOT_RETRY_MS       60000
-
-struct sram_snapshot_slot_t
-{
-	bool enabled = false;
-	bool dirty = false;
-	uint32_t flush_timer = 0;
-	char save_path[sizeof(sd_image[0].path)] = {};
-	char db_path[sizeof(sd_image[0].path) + 32] = {};
-};
-
-static sram_snapshot_slot_t sram_snapshot_slots[SRAM_SNAPSHOT_MAX_SLOTS] = {};
-
-struct sram_snapshot_autosave_t
-{
-	bool scanned = false;
-	bool found = false;
-	bool ex = false;
-	uint32_t timer = 0;
-	char opt[32] = {};
-	char label[96] = {};
-};
-
-static sram_snapshot_autosave_t sram_snapshot_autosave = {};
-
-#if SQLITE_SRAM_SNAPSHOTS
-static uint32_t sram_snapshot_interval_ms()
-{
-	uint32_t interval_sec = cfg.sram_autosave_interval;
-	if (!interval_sec) interval_sec = 300;
-	if (interval_sec > (UINT32_MAX / 1000)) interval_sec = UINT32_MAX / 1000;
-	return interval_sec * 1000;
-}
-
-static int64_t sram_snapshot_timestamp_ms()
-{
-	struct timespec ts = {};
-	clock_gettime(CLOCK_REALTIME, &ts);
-	return (int64_t)ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
-}
-
-static bool sram_snapshot_exec(sqlite3 *db, const char *sql)
-{
-	char *err = 0;
-	int rc = sqlite3_exec(db, sql, 0, 0, &err);
-	if (rc != SQLITE_OK)
-	{
-		fprintf(stderr, "SRAM snapshot sqlite error: %s [%s]\n", err ? err : "(unknown)", sql);
-		if (err) sqlite3_free(err);
-		return false;
-	}
-
-	return true;
-}
-
-static uint32_t sram_snapshot_crc32(const uint8_t *data, size_t size)
-{
-	if (!data || !size) return 0;
-	return (uint32_t)mz_crc32(MZ_CRC32_INIT, data, size);
-}
-
-static bool sram_snapshot_schema_has_crc32(sqlite3 *db)
-{
-	sqlite3_stmt *stmt = 0;
-	int rc = sqlite3_prepare_v2(db, "SELECT id, ts_ms, crc32, sram FROM snapshots LIMIT 1;", -1, &stmt, 0);
-	if (rc != SQLITE_OK) return false;
-	sqlite3_finalize(stmt);
-	return true;
-}
-
-static bool sram_snapshot_prepare_db(sqlite3 *db)
-{
-	if (!sram_snapshot_exec(db, "PRAGMA journal_mode=PERSIST;")) return false;
-	if (!sram_snapshot_exec(db, "PRAGMA synchronous=FULL;")) return false;
-	if (!sram_snapshot_exec(db, "PRAGMA auto_vacuum=NONE;")) return false;
-	if (!sram_snapshot_exec(db, "PRAGMA temp_store=MEMORY;")) return false;
-	if (!sram_snapshot_exec(db, "PRAGMA journal_size_limit=1048576;")) return false;
-
-	if (!sram_snapshot_exec(db, "CREATE TABLE IF NOT EXISTS snapshots (id INTEGER PRIMARY KEY, ts_ms INTEGER NOT NULL, crc32 INTEGER NOT NULL, sram BLOB NOT NULL);")) return false;
-	if (!sram_snapshot_schema_has_crc32(db))
-	{
-		fprintf(stderr, "SRAM snapshot schema mismatch: recreating snapshots table with CRC32.\n");
-		if (!sram_snapshot_exec(db, "DROP TABLE IF EXISTS snapshots;")) return false;
-		if (!sram_snapshot_exec(db, "CREATE TABLE snapshots (id INTEGER PRIMARY KEY, ts_ms INTEGER NOT NULL, crc32 INTEGER NOT NULL, sram BLOB NOT NULL);")) return false;
-	}
-	return true;
-}
-
-static bool sram_snapshot_open_db(const char *db_path, sqlite3 **db);
-static bool sram_snapshot_insert(sqlite3 *db, const std::vector<uint8_t> &data);
-
-static bool sram_snapshot_migrate_legacy_save(const char *save_path, const char *db_path)
-{
-	if (!save_path || !save_path[0] || !db_path || !db_path[0]) return true;
-	if (FileExists(db_path, 0)) return true;
-	if (!FileExists(save_path, 0)) return true;
-
-	fileTYPE legacy_file = {};
-	if (!FileOpenEx(&legacy_file, save_path, O_RDONLY))
-	{
-		fprintf(stderr, "SRAM snapshot migration warning: failed to open legacy save %s\n", save_path);
-		return false;
-	}
-
-	if (legacy_file.size < 0 || legacy_file.size > INT_MAX)
-	{
-		fprintf(stderr, "SRAM snapshot migration warning: invalid legacy save size %lld for %s\n",
-			(long long)legacy_file.size, save_path);
-		FileClose(&legacy_file);
-		return false;
-	}
-
-	const int legacy_size = (int)legacy_file.size;
-	std::vector<uint8_t> legacy_data((size_t)legacy_size);
-	bool read_ok = true;
-
-	if (legacy_size > 0)
-	{
-		const int read_size = FileReadAdv(&legacy_file, legacy_data.data(), legacy_size, -1);
-		read_ok = (read_size == legacy_size);
-	}
-
-	FileClose(&legacy_file);
-	if (!read_ok)
-	{
-		fprintf(stderr, "SRAM snapshot migration warning: failed to read legacy save %s\n", save_path);
-		return false;
-	}
-
-	sqlite3 *db = 0;
-	if (!sram_snapshot_open_db(db_path, &db))
-	{
-		fprintf(stderr, "SRAM snapshot migration warning: failed to open sqlite DB %s\n", db_path);
-		return false;
-	}
-
-	bool ok = sram_snapshot_insert(db, legacy_data);
-	sqlite3_close(db);
-
-	if (!ok)
-	{
-		char full_db_path[2100] = {};
-		snprintf(full_db_path, sizeof(full_db_path), "%s", getFullPath(db_path));
-		remove(full_db_path);
-		fprintf(stderr, "SRAM snapshot migration warning: failed to import %s into %s\n", save_path, db_path);
-		return false;
-	}
-
-	fprintf(stderr, "SRAM snapshot migrated legacy save: %s -> %s (%d bytes)\n", save_path, db_path, legacy_size);
-	return true;
-}
-
-static void sram_snapshot_configure_slot(uint8_t slot, const char *save_path);
-static void sram_snapshot_reset_export_trigger();
-
-static bool sram_snapshot_any_slot_enabled()
-{
-	for (uint8_t i = 0; i < SRAM_SNAPSHOT_MAX_SLOTS; i++)
-	{
-		if (sram_snapshot_slots[i].enabled) return true;
-	}
-	return false;
-}
-
-static bool sram_snapshot_ci_contains(const char *text, const char *needle)
-{
-	if (!text || !needle || !needle[0]) return false;
-
-	for (size_t i = 0; text[i]; i++)
-	{
-		size_t j = 0;
-		while (needle[j] && text[i + j] &&
-		       (tolower((unsigned char)text[i + j]) == tolower((unsigned char)needle[j])))
-		{
-			j++;
-		}
-		if (!needle[j]) return true;
-	}
-
-	return false;
-}
-
-static int sram_snapshot_export_trigger_score(const char *label)
-{
-	if (!label || !label[0]) return -1000;
-
-	const bool has_load = sram_snapshot_ci_contains(label, "load") || sram_snapshot_ci_contains(label, "restore");
-	if (has_load) return -1000;
-
-	const bool has_save = sram_snapshot_ci_contains(label, "save");
-	const bool has_write = sram_snapshot_ci_contains(label, "write");
-	const bool has_sram = sram_snapshot_ci_contains(label, "sram");
-	const bool has_nvram = sram_snapshot_ci_contains(label, "nvram");
-	const bool has_backup_ram = sram_snapshot_ci_contains(label, "backup ram");
-	const bool has_memory_card = sram_snapshot_ci_contains(label, "memory card") || sram_snapshot_ci_contains(label, "memcard");
-	const bool has_save_ram = sram_snapshot_ci_contains(label, "save ram");
-	const bool has_storage = has_sram || has_nvram || has_backup_ram || has_memory_card || has_save_ram;
-
-	// Avoid ambiguous actions: require explicit persistence verb.
-	if (!(has_save || has_write)) return -1000;
-
-	// Ignore generic save actions not related to persistent game RAM.
-	if (!(has_storage || has_sram || has_nvram)) return -1000;
-
-	int score = 0;
-	if (has_save) score += 100;
-	if (has_write) score += 80;
-	if (has_sram) score += 30;
-	if (has_nvram) score += 30;
-	if (has_backup_ram) score += 30;
-	if (has_memory_card) score += 20;
-	if (has_save_ram) score += 20;
-
-	// De-prioritize unrelated UI actions.
-	if (sram_snapshot_ci_contains(label, "state")) score -= 80;
-	if (sram_snapshot_ci_contains(label, "setting")) score -= 80;
-	if (sram_snapshot_ci_contains(label, "config")) score -= 80;
-
-	return score;
-}
-
-static bool sram_snapshot_find_export_trigger(char *opt_out, size_t opt_size, bool *ex_out, char *label_out, size_t label_size)
-{
-	int best_score = -1000;
-	char best_opt[32] = {};
-	char best_label[96] = {};
-	bool best_ex = false;
-
-	for (int i = 2;; i++)
-	{
-		char *entry = user_io_get_confstr(i);
-		if (!entry) break;
-
-		while ((entry[0] == 'H' || entry[0] == 'D' || entry[0] == 'h' || entry[0] == 'd') && strlen(entry) > 2)
-		{
-			entry += 2;
-		}
-
-		if (entry[0] == 'P' && strlen(entry) > 2 && entry[2] != ',')
-		{
-			entry += 2;
-		}
-
-		if (!(entry[0] == 'T' || entry[0] == 't' || entry[0] == 'R' || entry[0] == 'r')) continue;
-
-		char label[256] = {};
-		substrcpy(label, entry, 1);
-		int score = sram_snapshot_export_trigger_score(label);
-		if (score <= -1000) continue;
-
-		bool ex = (entry[0] == 't') || (entry[0] == 'r');
-		char opt[32] = {};
-		substrcpy(opt, entry + 1, 0);
-		if (!opt[0]) continue;
-
-		fprintf(stderr, "SRAM snapshot autosave candidate: opt=%s ex=%d label=%s score=%d\n",
-			opt, ex ? 1 : 0, label, score);
-
-		if (score <= best_score) continue;
-		best_score = score;
-		best_ex = ex;
-		snprintf(best_opt, sizeof(best_opt), "%s", opt);
-		snprintf(best_label, sizeof(best_label), "%s", label);
-	}
-
-	if (best_score <= -1000) return false;
-
-	snprintf(opt_out, opt_size, "%s", best_opt);
-	*ex_out = best_ex;
-	snprintf(label_out, label_size, "%s", best_label);
-	return true;
-}
-
-static void sram_snapshot_poll_export_trigger()
-{
-	if (!sram_snapshot_any_slot_enabled())
-	{
-		sram_snapshot_autosave.timer = 0;
-		return;
-	}
-
-	if (!sram_snapshot_autosave.scanned)
-	{
-		sram_snapshot_autosave.scanned = true;
-		user_io_read_confstr();
-		sram_snapshot_autosave.found = sram_snapshot_find_export_trigger(
-			sram_snapshot_autosave.opt,
-			sizeof(sram_snapshot_autosave.opt),
-			&sram_snapshot_autosave.ex,
-			sram_snapshot_autosave.label,
-			sizeof(sram_snapshot_autosave.label));
-
-		if (sram_snapshot_autosave.found)
-		{
-			fprintf(stderr, "SRAM snapshot autosave trigger found: opt=%s ex=%d label=%s\n",
-				sram_snapshot_autosave.opt,
-				sram_snapshot_autosave.ex ? 1 : 0,
-				sram_snapshot_autosave.label);
-		}
-		else
-		{
-			fprintf(stderr, "SRAM snapshot autosave trigger not found in core config string.\n");
-		}
-	}
-
-	if (!sram_snapshot_autosave.found) return;
-
-	if (!sram_snapshot_autosave.timer)
-	{
-		sram_snapshot_autosave.timer = GetTimer(sram_snapshot_interval_ms());
-		return;
-	}
-
-	if (!CheckTimer(sram_snapshot_autosave.timer)) return;
-
-	sram_snapshot_autosave.timer = GetTimer(sram_snapshot_interval_ms());
-	user_io_status_set(sram_snapshot_autosave.opt, 1, sram_snapshot_autosave.ex);
-	user_io_status_set(sram_snapshot_autosave.opt, 0, sram_snapshot_autosave.ex);
-
-	fprintf(stderr, "SRAM snapshot autosave trigger fired: opt=%s label=%s\n",
-		sram_snapshot_autosave.opt,
-		sram_snapshot_autosave.label);
-}
-
-static bool sram_snapshot_read_image(uint8_t slot, std::vector<uint8_t> &data)
-{
-	if (slot >= SRAM_SNAPSHOT_MAX_SLOTS) return false;
-
-	fileTYPE *img = &sd_image[slot];
-	if (!img->filp || img->size <= 0 || img->size > INT_MAX) return false;
-
-	const __off64_t old_offset = img->offset;
-	const int image_size = (int)img->size;
-
-	data.resize(image_size);
-
-	bool ok = false;
-	if (FileSeek(img, 0, SEEK_SET))
-	{
-		const int read_size = FileReadAdv(img, data.data(), image_size, -1);
-		ok = (read_size == image_size);
-	}
-
-	FileSeek(img, old_offset, SEEK_SET);
-
-	if (!ok) data.clear();
-	return ok;
-}
-
-static bool sram_snapshot_latest_matches(sqlite3 *db, const std::vector<uint8_t> &data, bool *matches)
-{
-	*matches = false;
-	const uint32_t data_crc = sram_snapshot_crc32(data.data(), data.size());
-
-	sqlite3_stmt *stmt = 0;
-	if (sqlite3_prepare_v2(db, "SELECT crc32, sram FROM snapshots ORDER BY id DESC LIMIT 1;", -1, &stmt, 0) != SQLITE_OK)
-	{
-		return false;
-	}
-
-	int rc = sqlite3_step(stmt);
-	if (rc == SQLITE_ROW)
-	{
-		const uint32_t stored_crc = (uint32_t)sqlite3_column_int64(stmt, 0);
-		const int blob_size = sqlite3_column_bytes(stmt, 1);
-		const void *blob = sqlite3_column_blob(stmt, 1);
-		if (stored_crc == data_crc && blob_size == (int)data.size() && (!blob_size || (blob && !memcmp(blob, data.data(), blob_size))))
-		{
-			*matches = true;
-		}
-	}
-	else if (rc != SQLITE_DONE)
-	{
-		sqlite3_finalize(stmt);
-		return false;
-	}
-
-	sqlite3_finalize(stmt);
-	return true;
-}
-
-static bool sram_snapshot_insert(sqlite3 *db, const std::vector<uint8_t> &data)
-{
-	if (!sram_snapshot_exec(db, "BEGIN IMMEDIATE;")) return false;
-	const uint32_t data_crc = sram_snapshot_crc32(data.data(), data.size());
-
-	bool ok = true;
-	sqlite3_stmt *stmt = 0;
-	if (sqlite3_prepare_v2(db, "INSERT INTO snapshots(ts_ms, crc32, sram) VALUES(?, ?, ?);", -1, &stmt, 0) != SQLITE_OK)
-	{
-		ok = false;
-	}
-	else
-	{
-		sqlite3_bind_int64(stmt, 1, sram_snapshot_timestamp_ms());
-		sqlite3_bind_int64(stmt, 2, data_crc);
-		sqlite3_bind_blob(stmt, 3, data.data(), (int)data.size(), SQLITE_TRANSIENT);
-
-		const int rc = sqlite3_step(stmt);
-		ok = (rc == SQLITE_DONE);
-		sqlite3_finalize(stmt);
-	}
-
-	if (ok)
-	{
-		char sql[192] = {};
-		snprintf(sql, sizeof(sql), "DELETE FROM snapshots WHERE id <= (SELECT IFNULL(MAX(id), 0) - %d FROM snapshots);", SRAM_SNAPSHOT_HISTORY_LIMIT);
-		if (!sram_snapshot_exec(db, sql)) ok = false;
-	}
-	if (ok && !sram_snapshot_exec(db, "COMMIT;")) ok = false;
-
-	if (!ok)
-	{
-		sram_snapshot_exec(db, "ROLLBACK;");
-		return false;
-	}
-
-	return true;
-}
-
-static bool sram_snapshot_open_db(const char *db_path, sqlite3 **db)
-{
-	char full_db_path[2100] = {};
-	snprintf(full_db_path, sizeof(full_db_path), "%s", getFullPath(db_path));
-
-	sqlite3 *tmp_db = 0;
-	int rc = sqlite3_open_v2(full_db_path, &tmp_db, SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE, 0);
-	if (rc != SQLITE_OK)
-	{
-		fprintf(stderr, "SRAM snapshot sqlite error: cannot open %s\n", full_db_path);
-		if (tmp_db) sqlite3_close(tmp_db);
-		return false;
-	}
-
-	sqlite3_busy_timeout(tmp_db, 10000);
-	if (!sram_snapshot_prepare_db(tmp_db))
-	{
-		sqlite3_close(tmp_db);
-		return false;
-	}
-
-	*db = tmp_db;
-	return true;
-}
-
-static bool sram_snapshot_load_latest(const char *db_path, std::vector<uint8_t> &data, bool *found)
-{
-	*found = false;
-	data.clear();
-
-	char full_db_path[2100] = {};
-	snprintf(full_db_path, sizeof(full_db_path), "%s", getFullPath(db_path));
-
-	struct stat st = {};
-	if (stat(full_db_path, &st) < 0)
-	{
-		return true;
-	}
-
-	sqlite3 *db = 0;
-	int rc = sqlite3_open_v2(full_db_path, &db, SQLITE_OPEN_READONLY, 0);
-	if (rc != SQLITE_OK)
-	{
-		if (db) sqlite3_close(db);
-		db = 0;
-		rc = sqlite3_open_v2(full_db_path, &db, SQLITE_OPEN_READWRITE, 0);
-	}
-	if (rc != SQLITE_OK)
-	{
-		fprintf(stderr, "SRAM snapshot sqlite error: cannot open for load %s\n", full_db_path);
-		if (db) sqlite3_close(db);
-		return false;
-	}
-
-	sqlite3_stmt *stmt = 0;
-	bool ok = true;
-	if (sqlite3_prepare_v2(db, "SELECT id, sram, crc32 FROM snapshots ORDER BY id DESC;", -1, &stmt, 0) != SQLITE_OK)
-	{
-		ok = false;
-	}
-	else
-	{
-		while (1)
-		{
-			const int rc = sqlite3_step(stmt);
-			if (rc == SQLITE_DONE) break;
-			if (rc != SQLITE_ROW)
-			{
-				ok = false;
-				break;
-			}
-
-			const int64_t row_id = sqlite3_column_int64(stmt, 0);
-			const int blob_size = sqlite3_column_bytes(stmt, 1);
-			const uint8_t *blob = (const uint8_t*)sqlite3_column_blob(stmt, 1);
-			const uint32_t stored_crc = (uint32_t)sqlite3_column_int64(stmt, 2);
-
-			if (blob_size > 0 && !blob)
-			{
-				fprintf(stderr, "SRAM snapshot load skip: %s row=%lld (null blob)\n", db_path, (long long)row_id);
-				continue;
-			}
-
-			const uint32_t calc_crc = sram_snapshot_crc32(blob, blob_size > 0 ? (size_t)blob_size : 0);
-			if (calc_crc != stored_crc)
-			{
-				fprintf(stderr, "SRAM snapshot load skip: %s row=%lld crc mismatch stored=%08X calc=%08X\n",
-					db_path, (long long)row_id, stored_crc, calc_crc);
-				continue;
-			}
-
-			if (blob_size > 0)
-			{
-				data.assign(blob, blob + blob_size);
-			}
-			else
-			{
-				data.clear();
-			}
-
-			*found = true;
-			fprintf(stderr, "SRAM snapshot load row: %s row=%lld (%d bytes, crc=%08X)\n",
-				db_path, (long long)row_id, blob_size, stored_crc);
-			break;
-		}
-
-		if (ok && !*found)
-		{
-			fprintf(stderr, "SRAM snapshot load: no valid rows in %s\n", db_path);
-		}
-		sqlite3_finalize(stmt);
-	}
-
-	sqlite3_close(db);
-	return ok;
-}
-
-static bool sram_snapshot_write_image(fileTYPE *img, const uint8_t *data, size_t size)
-{
-	if (!img || !img->filp) return false;
-	if (!FileSeek(img, 0, SEEK_SET)) return false;
-
-	if (size)
-	{
-		const int write_size = FileWriteAdv(img, (void*)data, (int)size, -1);
-		if (write_size != (int)size) return false;
-	}
-
-	return FileSeek(img, 0, SEEK_SET);
-}
-
-static bool sram_snapshot_fill_ff(fileTYPE *img, int total_bytes)
-{
-	if (!img || !img->filp || total_bytes <= 0) return false;
-	if (!FileSeek(img, 0, SEEK_SET)) return false;
-
-	static uint8_t ff_buf[4096] = {};
-	static bool ff_init = false;
-	if (!ff_init)
-	{
-		memset(ff_buf, 0xFF, sizeof(ff_buf));
-		ff_init = true;
-	}
-
-	int remaining = total_bytes;
-	while (remaining > 0)
-	{
-		int chunk = (remaining > (int)sizeof(ff_buf)) ? (int)sizeof(ff_buf) : remaining;
-		if (FileWriteAdv(img, ff_buf, chunk, -1) != chunk) return false;
-		remaining -= chunk;
-	}
-
-	return FileSeek(img, 0, SEEK_SET);
-}
-
-static bool sram_snapshot_mount_virtual(uint8_t slot, const char *save_path, int pre_size)
-{
-	if (slot >= SRAM_SNAPSHOT_MAX_SLOTS || !save_path || !save_path[0]) return false;
-
-	sram_snapshot_configure_slot(slot, save_path);
-
-	char tmp_path[64] = {};
-	snprintf(tmp_path, sizeof(tmp_path), "/tmp/mister_sram_slot_%u.bin", slot);
-
-	if (!FileOpenEx(&sd_image[slot], tmp_path, O_CREAT | O_RDWR | O_TRUNC | O_SYNC, 1, 0))
-	{
-		fprintf(stderr, "SRAM snapshot error: failed to create temporary save image \"%s\".\n", tmp_path);
-		sram_snapshot_configure_slot(slot, 0);
-		return false;
-	}
-	snprintf(sd_image[slot].path, sizeof(sd_image[slot].path), "%s", tmp_path);
-
-	if (!sram_snapshot_migrate_legacy_save(save_path, sram_snapshot_slots[slot].db_path))
-	{
-		fprintf(stderr, "SRAM snapshot warning: legacy save migration failed for \"%s\".\n", save_path);
-	}
-
-	std::vector<uint8_t> latest;
-	bool found = false;
-	if (!sram_snapshot_load_latest(sram_snapshot_slots[slot].db_path, latest, &found))
-	{
-		fprintf(stderr, "SRAM snapshot warning: failed to load latest snapshot for \"%s\".\n", save_path);
-	}
-	const bool have_snapshot = found && !latest.empty();
-
-	if (have_snapshot)
-	{
-		if (!sram_snapshot_write_image(&sd_image[slot], latest.data(), latest.size()))
-		{
-			fprintf(stderr, "SRAM snapshot error: failed to restore snapshot for \"%s\".\n", save_path);
-			FileClose(&sd_image[slot]);
-			sram_snapshot_configure_slot(slot, 0);
-			return false;
-		}
-
-		// Keep expected SRAM size for cores that rely on fixed geometry.
-		if (pre_size > (int)latest.size())
-		{
-			if (!FileSeek(&sd_image[slot], latest.size(), SEEK_SET))
-			{
-				FileClose(&sd_image[slot]);
-				sram_snapshot_configure_slot(slot, 0);
-				return false;
-			}
-
-			int remaining = pre_size - (int)latest.size();
-			static uint8_t ff_buf[4096] = {};
-			static bool ff_init = false;
-			if (!ff_init)
-			{
-				memset(ff_buf, 0xFF, sizeof(ff_buf));
-				ff_init = true;
-			}
-
-			while (remaining > 0)
-			{
-				int chunk = (remaining > (int)sizeof(ff_buf)) ? (int)sizeof(ff_buf) : remaining;
-				if (FileWriteAdv(&sd_image[slot], ff_buf, chunk, -1) != chunk)
-				{
-					FileClose(&sd_image[slot]);
-					sram_snapshot_configure_slot(slot, 0);
-					return false;
-				}
-				remaining -= chunk;
-			}
-
-			FileSeek(&sd_image[slot], 0, SEEK_SET);
-		}
-
-		fprintf(stderr, "SRAM snapshot loaded: %s (%d bytes)\n", save_path, (int)latest.size());
-	}
-	else if (pre_size > 0)
-	{
-		if (!sram_snapshot_fill_ff(&sd_image[slot], pre_size))
-		{
-			FileClose(&sd_image[slot]);
-			sram_snapshot_configure_slot(slot, 0);
-			return false;
-		}
-	}
-	if (!have_snapshot && pre_size <= 0)
-	{
-		// Preserve legacy blank-save behavior for unknown save size.
-		// This keeps reads beyond current file size as erased bytes (0xFF).
-		sd_image[slot].type = 2;
-	}
-
-	return true;
-}
-
-static void sram_snapshot_try_flush(uint8_t slot)
-{
-	if (slot >= SRAM_SNAPSHOT_MAX_SLOTS) return;
-
-	sram_snapshot_slot_t &state = sram_snapshot_slots[slot];
-	if (!state.enabled || !state.dirty) return;
-
-	std::vector<uint8_t> data;
-	if (!sram_snapshot_read_image(slot, data))
-	{
-		state.flush_timer = GetTimer(SRAM_SNAPSHOT_RETRY_MS);
-		return;
-	}
-
-	sqlite3 *db = 0;
-	if (!sram_snapshot_open_db(state.db_path, &db))
-	{
-		state.flush_timer = GetTimer(SRAM_SNAPSHOT_RETRY_MS);
-		return;
-	}
-	bool ok = true;
-	bool unchanged = false;
-
-	if (ok) ok = sram_snapshot_latest_matches(db, data, &unchanged);
-	if (ok && !unchanged) ok = sram_snapshot_insert(db, data);
-
-	sqlite3_close(db);
-
-	if (!ok)
-	{
-		state.flush_timer = GetTimer(SRAM_SNAPSHOT_RETRY_MS);
-		return;
-	}
-
-	state.dirty = false;
-	state.flush_timer = 0;
-
-	if (!unchanged)
-	{
-		fprintf(stderr, "SRAM snapshot saved: %s (%d bytes)\n", state.save_path, (int)data.size());
-	}
-	else
-	{
-		fprintf(stderr, "SRAM snapshot unchanged: %s (%d bytes)\n", state.save_path, (int)data.size());
-	}
-}
-
-static void sram_snapshot_configure_slot(uint8_t slot, const char *save_path)
-{
-	if (slot >= SRAM_SNAPSHOT_MAX_SLOTS) return;
-
-	sram_snapshot_slot_t &state = sram_snapshot_slots[slot];
-	memset(&state, 0, sizeof(state));
-
-	if (!save_path || !save_path[0]) return;
-
-	state.enabled = true;
-	snprintf(state.save_path, sizeof(state.save_path), "%s", save_path);
-	snprintf(state.db_path, sizeof(state.db_path), "%s.sqlite3", save_path);
-}
-
-static void sram_snapshot_reset_export_trigger()
-{
-	memset(&sram_snapshot_autosave, 0, sizeof(sram_snapshot_autosave));
-}
-
-static void sram_snapshot_poll()
-{
-	for (uint8_t i = 0; i < SRAM_SNAPSHOT_MAX_SLOTS; i++)
-	{
-		sram_snapshot_slot_t &state = sram_snapshot_slots[i];
-		if (!state.enabled || !state.dirty || !state.flush_timer) continue;
-		if (!CheckTimer(state.flush_timer)) continue;
-
-		sram_snapshot_try_flush(i);
-	}
-}
-
-static bool sram_snapshot_enabled(uint8_t slot)
-{
-	return (slot < SRAM_SNAPSHOT_MAX_SLOTS) && sram_snapshot_slots[slot].enabled;
-}
-
-static void sram_snapshot_flush_slot(uint8_t slot)
-{
-	if (slot >= SRAM_SNAPSHOT_MAX_SLOTS) return;
-	if (!sram_snapshot_slots[slot].enabled || !sram_snapshot_slots[slot].dirty) return;
-	sram_snapshot_try_flush(slot);
-}
-#else
-static void sram_snapshot_configure_slot(uint8_t, const char *)
-{
-}
-
-static void sram_snapshot_poll()
-{
-}
-
-static bool sram_snapshot_enabled(uint8_t)
-{
-	return false;
-}
-
-static bool sram_snapshot_mount_virtual(uint8_t, const char *, int)
-{
-	return false;
-}
-
-static void sram_snapshot_flush_slot(uint8_t)
-{
-}
-
-static void sram_snapshot_poll_export_trigger()
-{
-}
-
-static void sram_snapshot_reset_export_trigger()
-{
-}
-#endif
-
-void user_io_mark_save_dirty(unsigned char index)
-{
-	if (index >= SRAM_SNAPSHOT_MAX_SLOTS) return;
-	if (!sram_snapshot_slots[index].enabled) return;
-
-	sram_snapshot_slots[index].dirty = true;
-	if (!sram_snapshot_slots[index].flush_timer)
-	{
-		sram_snapshot_slots[index].flush_timer = GetTimer(sram_snapshot_interval_ms());
-	}
-}
-
-int user_io_sqlite_sram_only()
-{
-#if SQLITE_SRAM_SNAPSHOTS
-	return 1;
-#else
-	return 0;
-#endif
-}
 
 // mouse and keyboard emulation state
 static int emu_mode = EMU_NONE;
@@ -2216,7 +1398,6 @@ void user_io_init(const char *path, const char *xml)
 	}
 
 	user_io_read_confstr();
-	sram_snapshot_reset_export_trigger();
 	user_io_read_core_name();
 
 	if ((fpga_get_buttons() & BUTTON_OSD) && is_menu())
@@ -2226,6 +1407,7 @@ void user_io_init(const char *path, const char *xml)
 	}
 
 	cfg_parse();
+	sram_store_reset();
 	cfg_print();
 	while (cfg.waitmount[0] && !is_menu())
 	{
@@ -2849,27 +2031,21 @@ void user_io_file_info(const char *ext)
 
 int user_io_file_mount(const char *name, unsigned char index, char pre, int pre_size)
 {
-	if (index >= 16)
-	{
-		printf("Invalid mount index: %u\n", index);
-		return 0;
-	}
-
 	int writable = 0;
 	int ret = 0;
 	int len = strlen(name);
 	int img_type = 0; // disk image type (for C128 core): bit 0=dual sided, 1=raw GCR supported, 2=raw MFM supported, 3=high density
 
-	sram_snapshot_flush_slot(index);
+	sram_store_before_mount(index);
 
 	sd_image_cangrow[index] = (pre != 0);
 	sd_type[index] = SD_TYPE_DEFAULT ;
 	if (len)
 	{
-		if (pre)
+		if (pre && sram_store_mount_virtual(index, name, pre_size, &sd_image[index]))
 		{
 			writable = 1;
-			ret = sram_snapshot_mount_virtual(index, name, pre_size);
+			ret = 1;
 		}
 		else if (!ret)
 		{
@@ -2931,8 +2107,7 @@ int user_io_file_mount(const char *name, unsigned char index, char pre, int pre_
 
 		if (!ret)
 		{
-			if (pre) printf("Failed to mount SQLite-backed save for %s\n", name);
-			else printf("Failed to open file %s\n", name);
+			printf("Failed to open file %s\n", name);
 		}
 	}
 	else
@@ -2943,8 +2118,6 @@ int user_io_file_mount(const char *name, unsigned char index, char pre, int pre_
 
 	buffer_lba[index] = -1;
 	if (!index || is_cdi() || (is_saturn() && index==1)) use_save = pre;
-
-	if (!(pre && len && ret)) sram_snapshot_configure_slot(index, 0);
 
 	if (!ret)
 	{
@@ -2972,7 +2145,7 @@ int user_io_file_mount(const char *name, unsigned char index, char pre, int pre_
 	spi8(UIO_SET_SDINFO);
 
 	__off64_t size = sd_image[index].size;
-	if (!ret && pre && !user_io_sqlite_sram_only())
+	if (!ret && pre && sram_store_use_legacy_file_mode())
 	{
 		sd_image[index].type = 2;
 		strcpy(sd_image[index].path, name);
@@ -3527,16 +2700,16 @@ int user_io_file_tx(const char* name, unsigned char index, char opensave, char m
 			FileSeek(&f, 256, SEEK_SET);
 			bytes2send = 64 * 1024;
 		}
-			else if (snes_file == SNES_FILE_ROM) {
-				printf("Load SNES ROM.\n");
-				uint8_t* snes_hdr = snes_get_header(&f);
-				hexdump(snes_hdr, 16, 0);
-				user_io_file_tx_data(snes_hdr, 512);
+		else if (snes_file == SNES_FILE_ROM) {
+			printf("Load SNES ROM.\n");
+			uint8_t* buf = snes_get_header(&f);
+			hexdump(buf, 16, 0);
+			user_io_file_tx_data(buf, 512);
 
-				//strip original SNES ROM header if present (not used)
-				if ((bytes2send % 1024) == 512)
-				{
-					bytes2send -= 512;
+			//strip original SNES ROM header if present (not used)
+			if ((bytes2send % 1024) == 512)
+			{
+				bytes2send -= 512;
 				FileReadSec(&f, buf);
 			}
 		}
@@ -3997,13 +3170,10 @@ void user_io_poll()
 				sz = 512;
 				blksz = 512;
 				blks = 1;
-				}
-				DisableIO();
-
-				if (disk < 0 || disk >= 16 || !op) continue;
-
-				if ( sd_type[disk] == SD_TYPE_A2)
-				{
+			}
+			DisableIO();
+			if ( sd_type[disk] == SD_TYPE_A2)
+			{
 				//if (op) printf("A2 %x %llu on %d\n", op,lba, disk);
 				if (op == 2) a2_writeDSK(&sd_image[disk], lba, ack);
 				else if (op & 1) a2_readDSK(&sd_image[disk], lba, ack);
@@ -4021,18 +3191,16 @@ void user_io_poll()
 				// If n64_process_save returns false (e.g. use_save is off, or unsupported op), 
 				// it will fall through to the generic handler below.
 			}
-				else if (op == 2)
-				{
-					//printf("SD WR %llu on %d\n", lba, disk);
-					bool wrote_save_data = false;
-					bool snapshot_slot = sram_snapshot_enabled(disk);
-					if (snapshot_slot)
-					{
-						fprintf(stderr, "SRAM snapshot write req: slot=%d lba=%llu sz=%u blksz=%u type=%d file_size=%lld\n",
-							disk, (unsigned long long)lba, sz, blksz, sd_image[disk].type, (long long)sd_image[disk].size);
-					}
+			else if (op == 2)
+			{
+				//printf("SD WR %llu on %d\n", lba, disk);
+				bool wrote_save_data = false;
+				bool sram_store_slot = sram_store_slot_intercepts(disk);
 
-					buffer_lba[disk] = -1;
+				if (use_save) menu_process_save();
+				if (sram_store_slot) sram_store_mark_write(disk);
+
+				buffer_lba[disk] = -1;
 
 				// Fetch sector data from FPGA ...
 				EnableIO();
@@ -4040,64 +3208,50 @@ void user_io_poll()
 				spi_block_read(buffer[disk], fio_size, sz);
 				DisableIO();
 
-					if (sd_image[disk].type == 2 && !lba)
+				if (sd_image[disk].type == 2 && !lba)
+				{
+					//Create the file
+					if (FileOpenEx(&sd_image[disk], sd_image[disk].path, O_CREAT | O_RDWR | O_SYNC))
 					{
-						//Create the file
-						if (FileOpenEx(&sd_image[disk], sd_image[disk].path, O_CREAT | O_RDWR | O_SYNC))
+						diskled_on();
+						if (FileWriteAdv(&sd_image[disk], buffer[disk], sz))
 						{
-							diskled_on();
-							if (FileWriteAdv(&sd_image[disk], buffer[disk], sz))
-							{
-								sd_image[disk].size = FileGetSize(&sd_image[disk]);
-								wrote_save_data = true;
-							}
+							sd_image[disk].size = sz;
+							wrote_save_data = true;
 						}
+					}
 					else
 					{
 						printf("Error in creating file: %s\n", sd_image[disk].path);
 					}
-				}
-				else
-				{
-					// ... and write it to disk
+					}
+					else
+					{
+						// ... and write it to disk
 						uint64_t size = sd_image[disk].size / blksz;
-						if (sz && (lba <= size || sd_image_cangrow[disk]))
+						if (sz && lba <= size)
 						{
 							diskled_on();
 							if (FileSeek(&sd_image[disk], lba * blksz, SEEK_SET))
 							{
-							if (!sd_image_cangrow[disk])
-							{
-								__off64_t rem = sd_image[disk].size - sd_image[disk].offset;
-								sz = (rem >= sz) ? sz : (int)rem;
-							}
-
-								if (sz)
+								if (!sd_image_cangrow[disk])
 								{
-									if (FileWriteAdv(&sd_image[disk], buffer[disk], sz))
-									{
-										wrote_save_data = true;
-									}
+									__off64_t rem = sd_image[disk].size - sd_image[disk].offset;
+									sz = (rem >= sz) ? sz : (int)rem;
+								}
+
+								if (sz && FileWriteAdv(&sd_image[disk], buffer[disk], sz) == (int)sz)
+								{
+									wrote_save_data = true;
+								}
 							}
 						}
 					}
-				}
 
-					if (snapshot_slot)
-					{
-						// Some cores rewrite sectors with patterns we may classify as unchanged.
-						// Mark dirty on any save-slot write request and let flush deduplicate.
-						user_io_mark_save_dirty(disk);
-					}
-
-					if (wrote_save_data)
-					{
-						if (use_save) menu_process_save();
-						if (snapshot_slot) sram_snapshot_flush_slot(disk);
-					}
+					if (sram_store_slot) sram_store_finish_write(disk, wrote_save_data);
 				}
-			else if (op & 1)
-			{
+				else if (op & 1)
+				{
 				uint32_t buf_n = sizeof(buffer[0]) / blksz;
 				if (is_psx() && blksz == 2352)
 				{
@@ -4532,8 +3686,7 @@ void user_io_poll()
 		if (save_req) c64_save_cart(save_req >> 8);
 	}
 	process_ss(0);
-	sram_snapshot_poll_export_trigger();
-	sram_snapshot_poll();
+	sram_store_poll();
 }
 
 static void send_keycode(unsigned short key, int press)
