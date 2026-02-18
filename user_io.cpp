@@ -2037,17 +2037,17 @@ int user_io_file_mount(const char *name, unsigned char index, char pre, int pre_
 	int img_type = 0; // disk image type (for C128 core): bit 0=dual sided, 1=raw GCR supported, 2=raw MFM supported, 3=high density
 
 	sram_store_before_mount(index);
+	if (pre && sram_store_mount_virtual(index, name, pre_size, &sd_image[index]))
+	{
+		writable = 1;
+		ret = 1;
+	}
 
 	sd_image_cangrow[index] = (pre != 0);
 	sd_type[index] = SD_TYPE_DEFAULT ;
 	if (len)
 	{
-		if (pre && sram_store_mount_virtual(index, name, pre_size, &sd_image[index]))
-		{
-			writable = 1;
-			ret = 1;
-		}
-		else if (!ret)
+		if (!ret)
 		{
 			if (x2trd_ext_supp(name))
 			{
@@ -2145,7 +2145,7 @@ int user_io_file_mount(const char *name, unsigned char index, char pre, int pre_
 	spi8(UIO_SET_SDINFO);
 
 	__off64_t size = sd_image[index].size;
-	if (!ret && pre && sram_store_use_legacy_file_mode())
+	if (!ret && pre)
 	{
 		sd_image[index].type = 2;
 		strcpy(sd_image[index].path, name);
@@ -3194,11 +3194,8 @@ void user_io_poll()
 			else if (op == 2)
 			{
 				//printf("SD WR %llu on %d\n", lba, disk);
-				bool wrote_save_data = false;
-				bool sram_store_slot = sram_store_slot_intercepts(disk);
 
 				if (use_save) menu_process_save();
-				if (sram_store_slot) sram_store_mark_write(disk);
 
 				buffer_lba[disk] = -1;
 
@@ -3217,41 +3214,37 @@ void user_io_poll()
 						if (FileWriteAdv(&sd_image[disk], buffer[disk], sz))
 						{
 							sd_image[disk].size = sz;
-							wrote_save_data = true;
 						}
 					}
 					else
 					{
 						printf("Error in creating file: %s\n", sd_image[disk].path);
 					}
-					}
-					else
+				}
+				else
+				{
+					// ... and write it to disk
+					uint64_t size = sd_image[disk].size / blksz;
+					if (sz && lba <= size)
 					{
-						// ... and write it to disk
-						uint64_t size = sd_image[disk].size / blksz;
-						if (sz && lba <= size)
+						diskled_on();
+						if (FileSeek(&sd_image[disk], lba * blksz, SEEK_SET))
 						{
-							diskled_on();
-							if (FileSeek(&sd_image[disk], lba * blksz, SEEK_SET))
+							if (!sd_image_cangrow[disk])
 							{
-								if (!sd_image_cangrow[disk])
-								{
-									__off64_t rem = sd_image[disk].size - sd_image[disk].offset;
-									sz = (rem >= sz) ? sz : (int)rem;
-								}
-
-								if (sz && FileWriteAdv(&sd_image[disk], buffer[disk], sz) == (int)sz)
-								{
-									wrote_save_data = true;
-								}
+								__off64_t rem = sd_image[disk].size - sd_image[disk].offset;
+								sz = (rem >= sz) ? sz : (int)rem;
 							}
+
+							if (sz) FileWriteAdv(&sd_image[disk], buffer[disk], sz);
 						}
 					}
-
-					if (sram_store_slot) sram_store_finish_write(disk, wrote_save_data);
 				}
-				else if (op & 1)
-				{
+
+				sram_store_after_write(disk);
+			}
+			else if (op & 1)
+			{
 				uint32_t buf_n = sizeof(buffer[0]) / blksz;
 				if (is_psx() && blksz == 2352)
 				{

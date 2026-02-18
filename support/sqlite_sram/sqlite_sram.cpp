@@ -757,18 +757,6 @@ void sqlite_sram_unmount_slot(uint8_t slot)
 #endif
 }
 
-bool sqlite_sram_slot_enabled(uint8_t slot)
-{
-#if SQLITE_SRAM_SNAPSHOTS
-	if (!sqlite_sram_runtime_enabled()) return false;
-	if (slot >= SQLITE_SRAM_MAX_SLOTS) return false;
-	return g_slots[slot].enabled;
-#else
-	(void)slot;
-	return false;
-#endif
-}
-
 void sqlite_sram_mark_save_dirty(uint8_t slot)
 {
 #if SQLITE_SRAM_SNAPSHOTS
