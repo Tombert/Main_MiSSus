@@ -17,6 +17,12 @@ CREATE TABLE IF NOT EXISTS snapshots (
 	{"202602180002_add_snapshots_tag.sql", R"__MIG__(
 ALTER TABLE snapshots ADD COLUMN tag TEXT DEFAULT NULL;
 )__MIG__"},
+	{"202602180003_create_snapshot_tombstones.sql", R"__MIG__(
+CREATE TABLE IF NOT EXISTS snapshot_tombstones (
+	snapshot_id INTEGER PRIMARY KEY,
+	ts_ms INTEGER NOT NULL
+);
+)__MIG__"},
 };
 
 const size_t g_sqlite_sram_migrations_count = sizeof(g_sqlite_sram_migrations) / sizeof(g_sqlite_sram_migrations[0]);

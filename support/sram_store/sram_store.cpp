@@ -28,3 +28,28 @@ void sram_store_poll()
 {
 	sqlite_sram_poll();
 }
+
+bool sram_store_ui_available()
+{
+	return sqlite_sram_ui_available();
+}
+
+bool sram_store_tag_latest(const char *tag)
+{
+	return sqlite_sram_tag_latest(tag);
+}
+
+int sram_store_list_tagged(sram_store_tagged_snapshot_t *out, int max_items)
+{
+	return sqlite_sram_list_tagged(out, max_items);
+}
+
+bool sram_store_restore_tagged(int64_t snapshot_id)
+{
+	return sqlite_sram_restore_tagged(snapshot_id);
+}
+
+bool sram_store_delete_tagged(int64_t snapshot_id)
+{
+	return sqlite_sram_delete_tagged(snapshot_id);
+}

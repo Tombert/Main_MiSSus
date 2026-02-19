@@ -64,6 +64,7 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
 #include "bootcore.h"
 #include "ide.h"
 #include "profiling.h"
+#include "support/sram_store/sram_store.h"
 
 /*menu states*/
 enum MENU
@@ -160,6 +161,10 @@ enum MENU
 	MENU_GENERIC_FILE_SELECTED,
 	MENU_GENERIC_IMAGE_SELECTED,
 	MENU_GENERIC_SAVE_WAIT,
+	MENU_GENERIC_SRAM_TAG1,
+	MENU_GENERIC_SRAM_TAG2,
+	MENU_GENERIC_SRAM_RESTORE1,
+	MENU_GENERIC_SRAM_RESTORE2,
 
 	// Arcade
 	MENU_ARCADE_DIP1,
@@ -214,6 +219,13 @@ static uint32_t menu_timer = 0;
 static uint32_t menu_save_timer = 0;
 static uint32_t load_addr = 0;
 static int32_t  bt_timer = 0;
+static uint32_t sqlite_sram_tag_entry = UINT32_MAX;
+static uint32_t sqlite_sram_restore_entry = UINT32_MAX;
+static uint32_t sqlite_sram_delete_entry = UINT32_MAX;
+static bool sqlite_sram_delete_mode = false;
+static char sqlite_sram_tag_text[SRAM_STORE_TAG_MAX_LEN] = {};
+static sram_store_tagged_snapshot_t sqlite_sram_tagged_list[63] = {};
+static int sqlite_sram_tagged_count = 0;
 
 static bool osd_unlocked = 1;
 static char osd_code_entry[32];
@@ -1691,13 +1703,16 @@ void HandleUI(void)
 		}
 		break;
 
-	case MENU_GENERIC_MAIN1: {
-		hdmask = spi_uio_cmd16(UIO_GET_OSDMASK, 0);
-		user_io_read_confstr();
-		uint32_t s_entry = 0;
-		int entry = 0;
-		while(1)
-		{
+		case MENU_GENERIC_MAIN1: {
+			hdmask = spi_uio_cmd16(UIO_GET_OSDMASK, 0);
+			user_io_read_confstr();
+			uint32_t s_entry = 0;
+			sqlite_sram_tag_entry = UINT32_MAX;
+			sqlite_sram_restore_entry = UINT32_MAX;
+			sqlite_sram_delete_entry = UINT32_MAX;
+			int entry = 0;
+			while(1)
+			{
 			if (!menusub) firstmenu = 0;
 
 			adjvisible = 0;
@@ -1976,9 +1991,30 @@ void HandleUI(void)
 				}
 			} while (p);
 
-			if (!entry) break;
+				if (!entry) break;
 
-			for (; entry < OsdGetSize() - 1; entry++) MenuWrite(entry, "", 0, 0);
+				if (!page && sram_store_ui_available())
+				{
+					sqlite_sram_tag_entry = selentry;
+					MenuWrite(entry, " Tag latest SRAM snapshot  \x16", menusub == selentry, 0);
+					menumask = (menumask << 1) | 1;
+					entry++;
+					selentry++;
+
+					sqlite_sram_restore_entry = selentry;
+					MenuWrite(entry, " Restore tagged SRAM save  \x16", menusub == selentry, 0);
+					menumask = (menumask << 1) | 1;
+					entry++;
+					selentry++;
+
+					sqlite_sram_delete_entry = selentry;
+					MenuWrite(entry, " Delete tagged SRAM save   \x16", menusub == selentry, 0);
+					menumask = (menumask << 1) | 1;
+					entry++;
+					selentry++;
+				}
+
+				for (; entry < OsdGetSize() - 1; entry++) MenuWrite(entry, "", 0, 0);
 
 			// exit row
 			if (!page)
@@ -2078,16 +2114,39 @@ void HandleUI(void)
 				page = 0;
 			}
 		}
-		else if (select || recent || minus || plus || !mgl->done)
-		{
-			if (!mgl->done)
+			else if (select || recent || minus || plus || !mgl->done)
 			{
-				menusub = mgl->item[mgl->current].submenu;
-				select = 1;
-			}
+				if (!mgl->done)
+				{
+					menusub = mgl->item[mgl->current].submenu;
+					select = 1;
+				}
 
-			if (dip_submenu == menusub && select)
-			{
+				if (select && menusub == sqlite_sram_tag_entry)
+				{
+					sqlite_sram_tag_text[0] = 0;
+					menustate = MENU_GENERIC_SRAM_TAG1;
+					break;
+				}
+					if (select && menusub == sqlite_sram_restore_entry)
+					{
+						sqlite_sram_delete_mode = false;
+						firstmenu = 0;
+						menusub = 0;
+						menustate = MENU_GENERIC_SRAM_RESTORE1;
+						break;
+					}
+					if (select && menusub == sqlite_sram_delete_entry)
+					{
+						sqlite_sram_delete_mode = true;
+						firstmenu = 0;
+						menusub = 0;
+						menustate = MENU_GENERIC_SRAM_RESTORE1;
+						break;
+					}
+
+				if (dip_submenu == menusub && select)
+				{
 				menustate = MENU_ARCADE_DIP1;
 				menusub = 0;
 			}
@@ -2385,10 +2444,163 @@ void HandleUI(void)
 			menustate = MENU_GENERIC_MAIN1;
 		}
 
-		break;
+			break;
 
-	case MENU_GENERIC_FILE_SELECTED:
+		case MENU_GENERIC_SRAM_TAG1:
+			helptext_idx = 0;
+			parentstate = menustate;
+			menumask = 0;
+			OsdSetTitle("Tag SRAM Snapshot", 0);
+			m = 0;
+			OsdWrite(m++);
+			OsdWrite(m++, " Enter name for latest save");
+			OsdWrite(m++);
+			snprintf(s, sizeof(s), " %s", sqlite_sram_tag_text);
+			if (strlen(s) < 28) strcat(s, "_");
+			OsdWrite(m++, s, 1, 0);
+			OsdWrite(m++);
+			OsdWrite(m++, " Enter: save tagged copy");
+			OsdWrite(m++, " Backspace: delete");
+			OsdWrite(m++, " Esc/F12: cancel");
+			while (m < OsdGetSize() - 1) OsdWrite(m++);
+			OsdWrite(m, STD_BACK, 0, 0);
+			menustate = MENU_GENERIC_SRAM_TAG2;
+			break;
+
+		case MENU_GENERIC_SRAM_TAG2:
+			if (menu || back || left)
+			{
+				menustate = MENU_GENERIC_MAIN1;
+				menusub = (sqlite_sram_tag_entry != UINT32_MAX) ? sqlite_sram_tag_entry : 0;
+				break;
+			}
+
+			if (select)
+			{
+				if (!sqlite_sram_tag_text[0]) Info("Tag cannot be empty", 2000, 0, 0, 0);
+				else if (!sram_store_tag_latest(sqlite_sram_tag_text)) Info("Failed to tag SRAM snapshot", 2000, 0, 0, 0);
+				else Info("Tagged SRAM snapshot", 1500, 0, 0, 0);
+
+				menustate = MENU_GENERIC_MAIN1;
+				menusub = (sqlite_sram_tag_entry != UINT32_MAX) ? sqlite_sram_tag_entry : 0;
+				break;
+			}
+
+			if (c == KEY_BACKSPACE)
+			{
+				size_t len = strlen(sqlite_sram_tag_text);
+				if (len)
+				{
+					sqlite_sram_tag_text[len - 1] = 0;
+					menustate = MENU_GENERIC_SRAM_TAG1;
+				}
+				break;
+			}
+
+			{
+				uint8_t ascii = GetASCIIKey(c);
+				size_t len = strlen(sqlite_sram_tag_text);
+				if (ascii > 1 && ascii < 0x7F && len < sizeof(sqlite_sram_tag_text) - 1)
+				{
+					sqlite_sram_tag_text[len] = (char)ascii;
+					sqlite_sram_tag_text[len + 1] = 0;
+					menustate = MENU_GENERIC_SRAM_TAG1;
+				}
+			}
+			break;
+
+		case MENU_GENERIC_SRAM_RESTORE1:
 		{
+			helptext_idx = 0;
+			parentstate = menustate;
+			sqlite_sram_tagged_count = sram_store_list_tagged(sqlite_sram_tagged_list, sizeof(sqlite_sram_tagged_list) / sizeof(sqlite_sram_tagged_list[0]));
+			if (sqlite_sram_tagged_count < 0) sqlite_sram_tagged_count = 0;
+
+			while (1)
+			{
+				if (!menusub) firstmenu = 0;
+				adjvisible = 0;
+				int entry = 0;
+				uint32_t selentry = 0;
+				menumask = 0;
+
+					OsdSetTitle(sqlite_sram_delete_mode ? "Delete Tagged SRAM" : "Restore Tagged SRAM", 0);
+
+				if (!sqlite_sram_tagged_count)
+				{
+					MenuWrite(entry++, " No tagged snapshots found", 0, 1);
+				}
+				else
+				{
+					for (int i = 0; i < sqlite_sram_tagged_count; i++)
+					{
+						snprintf(s, sizeof(s), " %2d. %.22s", i + 1, sqlite_sram_tagged_list[i].tag);
+						MenuWrite(entry, s, menusub == selentry, 0);
+						menumask = (menumask << 1) | 1;
+						entry++;
+						selentry++;
+					}
+				}
+
+					if (entry < OsdGetSize() - 1)
+					{
+						MenuWrite(entry++, sqlite_sram_delete_mode ? " Select: tombstone tag" : " Select: restore + reboot", 0, 1);
+					}
+					for (; entry < OsdGetSize() - 1; entry++) MenuWrite(entry, "", 0, 0);
+					MenuWrite(entry, STD_BACK, menusub == selentry, 0);
+				menusub_last = selentry;
+				menumask = (menumask << 1) | 1;
+
+				if (!adjvisible) break;
+				firstmenu += adjvisible;
+			}
+
+			if (menusub > menusub_last) menusub = menusub_last;
+			menustate = MENU_GENERIC_SRAM_RESTORE2;
+			break;
+		}
+
+			case MENU_GENERIC_SRAM_RESTORE2:
+				if (menu || back || left || (select && menusub == menusub_last))
+				{
+					menustate = MENU_GENERIC_MAIN1;
+					menusub = sqlite_sram_delete_mode
+						? ((sqlite_sram_delete_entry != UINT32_MAX) ? sqlite_sram_delete_entry : 0)
+						: ((sqlite_sram_restore_entry != UINT32_MAX) ? sqlite_sram_restore_entry : 0);
+					break;
+				}
+
+				if (select && sqlite_sram_tagged_count > 0 && menusub < (uint32_t)sqlite_sram_tagged_count)
+				{
+					if (sqlite_sram_delete_mode)
+					{
+						if (!sram_store_delete_tagged(sqlite_sram_tagged_list[menusub].id))
+						{
+							Info("Failed to delete tagged save", 2000, 0, 0, 0);
+						}
+						else
+						{
+							Info("Tagged save deleted", 1200, 0, 0, 0);
+						}
+						menustate = MENU_GENERIC_SRAM_RESTORE1;
+					}
+					else
+					{
+						if (!sram_store_restore_tagged(sqlite_sram_tagged_list[menusub].id))
+						{
+							Info("Failed to restore tagged save", 2000, 0, 0, 0);
+							menustate = MENU_GENERIC_SRAM_RESTORE1;
+						}
+						else
+						{
+							reboot(1);
+						}
+					}
+				}
+				break;
+
+		case MENU_GENERIC_FILE_SELECTED:
+			{
 			if (!mgl->done)
 			{
 				if(mgl->item[mgl->current].path[0] == '/') snprintf(selPath, sizeof(selPath), "%s", mgl->item[mgl->current].path);

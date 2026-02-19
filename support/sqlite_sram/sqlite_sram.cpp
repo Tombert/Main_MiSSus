@@ -10,6 +10,7 @@
 
 #include "support/sqlite_sram/sqlite_sram.h"
 #include "support/sqlite_sram/migrations.h"
+#include "support/sram_store/sram_store.h"
 
 #include "cfg.h"
 #include "hardware.h"
@@ -78,6 +79,66 @@ static bool sqlite_sram_exec(sqlite3 *db, const char *sql)
 		if (err) sqlite3_free(err);
 		return false;
 	}
+	return true;
+}
+
+static bool sqlite_sram_table_exists(sqlite3 *db, const char *name, bool *exists)
+{
+	if (!db || !name || !exists) return false;
+	*exists = false;
+
+	sqlite3_stmt *stmt = nullptr;
+	if (sqlite3_prepare_v2(db, "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?1 LIMIT 1;", -1, &stmt, 0) != SQLITE_OK)
+	{
+		return false;
+	}
+
+	sqlite3_bind_text(stmt, 1, name, -1, SQLITE_TRANSIENT);
+	const int rc = sqlite3_step(stmt);
+	if (rc == SQLITE_ROW) *exists = true;
+	else if (rc != SQLITE_DONE)
+	{
+		sqlite3_finalize(stmt);
+		return false;
+	}
+
+	sqlite3_finalize(stmt);
+	return true;
+}
+
+static bool sqlite_sram_column_exists(sqlite3 *db, const char *table, const char *column, bool *exists)
+{
+	if (!db || !table || !column || !exists) return false;
+	*exists = false;
+
+	char sql[256] = {};
+	snprintf(sql, sizeof(sql), "PRAGMA table_info(%s);", table);
+
+	sqlite3_stmt *stmt = nullptr;
+	if (sqlite3_prepare_v2(db, sql, -1, &stmt, 0) != SQLITE_OK)
+	{
+		return false;
+	}
+
+	while (1)
+	{
+		const int rc = sqlite3_step(stmt);
+		if (rc == SQLITE_DONE) break;
+		if (rc != SQLITE_ROW)
+		{
+			sqlite3_finalize(stmt);
+			return false;
+		}
+
+		const unsigned char *name = sqlite3_column_text(stmt, 1);
+		if (name && !strcmp((const char*)name, column))
+		{
+			*exists = true;
+			break;
+		}
+	}
+
+	sqlite3_finalize(stmt);
 	return true;
 }
 
@@ -220,8 +281,27 @@ static bool sqlite_sram_latest_matches(sqlite3 *db, const std::vector<uint8_t> &
 
 	const uint32_t data_crc = sqlite_sram_crc32(data.data(), data.size());
 
+	bool have_crc32 = false;
+	if (!sqlite_sram_column_exists(db, "snapshots", "crc32", &have_crc32))
+	{
+		fprintf(stderr, "SQLite SRAM warning: failed to check crc32 column for dedupe; assuming changed.\n");
+		return true;
+	}
+	if (!have_crc32) return true;
+
+	bool have_tombstones = false;
+	if (!sqlite_sram_table_exists(db, "snapshot_tombstones", &have_tombstones))
+	{
+		fprintf(stderr, "SQLite SRAM warning: failed to check tombstone table for dedupe, proceeding without tombstone filter.\n");
+		have_tombstones = false;
+	}
+
+	const char *latest_sql = have_tombstones
+		? "SELECT crc32, sram FROM snapshots s WHERE NOT EXISTS (SELECT 1 FROM snapshot_tombstones t WHERE t.snapshot_id = s.id) ORDER BY id DESC LIMIT 1;"
+		: "SELECT crc32, sram FROM snapshots ORDER BY id DESC LIMIT 1;";
+
 	sqlite3_stmt *stmt = nullptr;
-	if (sqlite3_prepare_v2(db, "SELECT crc32, sram FROM snapshots ORDER BY id DESC LIMIT 1;", -1, &stmt, 0) != SQLITE_OK)
+	if (sqlite3_prepare_v2(db, latest_sql, -1, &stmt, 0) != SQLITE_OK)
 	{
 		return false;
 	}
@@ -253,18 +333,34 @@ static bool sqlite_sram_insert(sqlite3 *db, const std::vector<uint8_t> &data)
 	if (!sqlite_sram_exec(db, "BEGIN IMMEDIATE;")) return false;
 
 	const uint32_t data_crc = sqlite_sram_crc32(data.data(), data.size());
+	bool have_crc32 = false;
+	if (!sqlite_sram_column_exists(db, "snapshots", "crc32", &have_crc32))
+	{
+		sqlite_sram_exec(db, "ROLLBACK;");
+		return false;
+	}
 
 	bool ok = true;
 	sqlite3_stmt *stmt = nullptr;
-	if (sqlite3_prepare_v2(db, "INSERT INTO snapshots(ts_ms, crc32, sram) VALUES(?, ?, ?);", -1, &stmt, 0) != SQLITE_OK)
+	const char *insert_sql = have_crc32
+		? "INSERT INTO snapshots(ts_ms, crc32, sram) VALUES(?, ?, ?);"
+		: "INSERT INTO snapshots(ts_ms, sram) VALUES(?, ?);";
+	if (sqlite3_prepare_v2(db, insert_sql, -1, &stmt, 0) != SQLITE_OK)
 	{
 		ok = false;
 	}
 	else
 	{
 		sqlite3_bind_int64(stmt, 1, sqlite_sram_timestamp_ms());
-		sqlite3_bind_int64(stmt, 2, data_crc);
-		sqlite3_bind_blob(stmt, 3, data.data(), (int)data.size(), SQLITE_TRANSIENT);
+		if (have_crc32)
+		{
+			sqlite3_bind_int64(stmt, 2, data_crc);
+			sqlite3_bind_blob(stmt, 3, data.data(), (int)data.size(), SQLITE_TRANSIENT);
+		}
+		else
+		{
+			sqlite3_bind_blob(stmt, 2, data.data(), (int)data.size(), SQLITE_TRANSIENT);
+		}
 		const int rc = sqlite3_step(stmt);
 		ok = (rc == SQLITE_DONE);
 		sqlite3_finalize(stmt);
@@ -277,9 +373,18 @@ static bool sqlite_sram_insert(sqlite3 *db, const std::vector<uint8_t> &data)
 			"DELETE FROM snapshots "
 			"WHERE tag IS NULL "
 			"AND id NOT IN (SELECT id FROM snapshots WHERE tag IS NULL ORDER BY id DESC LIMIT %d);",
-			SQLITE_SRAM_HISTORY_LIMIT);
+				SQLITE_SRAM_HISTORY_LIMIT);
 		if (!sqlite_sram_exec(db, sql)) ok = false;
 	}
+
+	bool have_tombstones = false;
+	if (ok && !sqlite_sram_table_exists(db, "snapshot_tombstones", &have_tombstones))
+	{
+		fprintf(stderr, "SQLite SRAM warning: failed to check tombstone table, skipping tombstone GC.\n");
+		have_tombstones = false;
+	}
+	if (ok && have_tombstones && !sqlite_sram_exec(db, "DELETE FROM snapshots WHERE id IN (SELECT snapshot_id FROM snapshot_tombstones);")) ok = false;
+	if (ok && have_tombstones && !sqlite_sram_exec(db, "DELETE FROM snapshot_tombstones WHERE snapshot_id NOT IN (SELECT id FROM snapshots);")) ok = false;
 	if (ok && !sqlite_sram_exec(db, "COMMIT;")) ok = false;
 
 	if (!ok)
@@ -291,7 +396,7 @@ static bool sqlite_sram_insert(sqlite3 *db, const std::vector<uint8_t> &data)
 	return true;
 }
 
-static bool sqlite_sram_load_latest(const char *db_path, std::vector<uint8_t> &data, bool *found)
+static bool sqlite_sram_load_latest(const char *db_path, int expected_size, std::vector<uint8_t> &data, bool *found)
 {
 	if (!db_path || !found) return false;
 	*found = false;
@@ -323,12 +428,46 @@ static bool sqlite_sram_load_latest(const char *db_path, std::vector<uint8_t> &d
 
 	sqlite3_stmt *stmt = nullptr;
 	bool ok = true;
-	if (sqlite3_prepare_v2(db, "SELECT id, sram, crc32 FROM snapshots ORDER BY id DESC;", -1, &stmt, 0) != SQLITE_OK)
+	bool have_crc32 = false;
+	if (!sqlite_sram_column_exists(db, "snapshots", "crc32", &have_crc32))
 	{
+		fprintf(stderr, "SQLite SRAM warning: failed to check crc32 column for load %s; proceeding without crc validation.\n", db_path);
+		have_crc32 = false;
+	}
+
+	bool have_tombstones = false;
+	if (!sqlite_sram_table_exists(db, "snapshot_tombstones", &have_tombstones))
+	{
+		fprintf(stderr, "SQLite SRAM warning: failed to check tombstone table for load %s, proceeding without tombstone filter.\n", db_path);
+		have_tombstones = false;
+	}
+
+	const char *load_sql = nullptr;
+	if (have_crc32)
+	{
+		load_sql = have_tombstones
+			? "SELECT id, sram, crc32 FROM snapshots s WHERE NOT EXISTS (SELECT 1 FROM snapshot_tombstones t WHERE t.snapshot_id = s.id) ORDER BY id DESC;"
+			: "SELECT id, sram, crc32 FROM snapshots ORDER BY id DESC;";
+	}
+	else
+	{
+		load_sql = have_tombstones
+			? "SELECT id, sram, NULL FROM snapshots s WHERE NOT EXISTS (SELECT 1 FROM snapshot_tombstones t WHERE t.snapshot_id = s.id) ORDER BY id DESC;"
+			: "SELECT id, sram, NULL FROM snapshots ORDER BY id DESC;";
+	}
+	if (sqlite3_prepare_v2(db, load_sql, -1, &stmt, 0) != SQLITE_OK)
+	{
+		fprintf(stderr, "SQLite SRAM sqlite error: failed preparing load query for %s (%s)\n", db_path, sqlite3_errmsg(db));
 		ok = false;
 	}
 	else
 	{
+		bool have_candidate = false;
+		int64_t best_row_id = 0;
+		int best_size = -1;
+		uint32_t best_crc = 0;
+		std::vector<uint8_t> best_data;
+
 		while (1)
 		{
 			const int step_rc = sqlite3_step(stmt);
@@ -339,10 +478,11 @@ static bool sqlite_sram_load_latest(const char *db_path, std::vector<uint8_t> &d
 				break;
 			}
 
-			const int64_t row_id = sqlite3_column_int64(stmt, 0);
-			const int blob_size = sqlite3_column_bytes(stmt, 1);
-			const uint8_t *blob = (const uint8_t*)sqlite3_column_blob(stmt, 1);
-			const uint32_t stored_crc = (uint32_t)sqlite3_column_int64(stmt, 2);
+				const int64_t row_id = sqlite3_column_int64(stmt, 0);
+				const int blob_size = sqlite3_column_bytes(stmt, 1);
+				const uint8_t *blob = (const uint8_t*)sqlite3_column_blob(stmt, 1);
+				const bool crc_is_null = (sqlite3_column_type(stmt, 2) == SQLITE_NULL);
+				const uint32_t stored_crc = (uint32_t)sqlite3_column_int64(stmt, 2);
 
 			if (blob_size > 0 && !blob)
 			{
@@ -350,24 +490,71 @@ static bool sqlite_sram_load_latest(const char *db_path, std::vector<uint8_t> &d
 				continue;
 			}
 
-			const uint32_t calc_crc = sqlite_sram_crc32(blob, blob_size > 0 ? (size_t)blob_size : 0);
-			if (calc_crc != stored_crc)
-			{
-				fprintf(stderr, "SQLite SRAM load skip: %s row=%lld crc mismatch stored=%08X calc=%08X\n",
-					db_path, (long long)row_id, stored_crc, calc_crc);
+				const uint32_t calc_crc = sqlite_sram_crc32(blob, blob_size > 0 ? (size_t)blob_size : 0);
+				if (have_crc32 && !crc_is_null && calc_crc != stored_crc)
+				{
+					fprintf(stderr, "SQLite SRAM load skip: %s row=%lld crc mismatch stored=%08X calc=%08X\n",
+						db_path, (long long)row_id, stored_crc, calc_crc);
 				continue;
 			}
 
-			if (blob_size > 0) data.assign(blob, blob + blob_size);
-			else data.clear();
+			if (expected_size <= 0)
+			{
+				if (blob_size > 0) best_data.assign(blob, blob + blob_size);
+				else best_data.clear();
+				best_row_id = row_id;
+				best_size = blob_size;
+				best_crc = stored_crc;
+				have_candidate = true;
+				break;
+			}
 
-			*found = true;
-			fprintf(stderr, "SQLite SRAM load row: %s row=%lld (%d bytes, crc=%08X)\n",
-				db_path, (long long)row_id, blob_size, stored_crc);
-			break;
+			if (blob_size == expected_size)
+			{
+				if (blob_size > 0) best_data.assign(blob, blob + blob_size);
+				else best_data.clear();
+				best_row_id = row_id;
+				best_size = blob_size;
+				best_crc = stored_crc;
+				have_candidate = true;
+				break;
+			}
+
+			if (!have_candidate || blob_size > best_size)
+			{
+				if (blob_size > 0) best_data.assign(blob, blob + blob_size);
+				else best_data.clear();
+				best_row_id = row_id;
+				best_size = blob_size;
+				best_crc = stored_crc;
+				have_candidate = true;
+			}
 		}
 
-		if (ok && !*found)
+		if (have_candidate)
+		{
+			data.swap(best_data);
+			*found = true;
+				if (expected_size > 0 && best_size != expected_size)
+				{
+					fprintf(stderr, "SQLite SRAM load row fallback: %s row=%lld (%d bytes, expected=%d, crc=%08X)\n",
+						db_path, (long long)best_row_id, best_size, expected_size, best_crc);
+				}
+				else
+				{
+					if (have_crc32)
+					{
+						fprintf(stderr, "SQLite SRAM load row: %s row=%lld (%d bytes, crc=%08X)\n",
+							db_path, (long long)best_row_id, best_size, best_crc);
+					}
+					else
+					{
+						fprintf(stderr, "SQLite SRAM load row: %s row=%lld (%d bytes, no-crc)\n",
+							db_path, (long long)best_row_id, best_size);
+					}
+				}
+			}
+		else if (ok && !*found)
 		{
 			fprintf(stderr, "SQLite SRAM load: no valid rows in %s\n", db_path);
 		}
@@ -727,6 +914,17 @@ static void sqlite_sram_poll_flush()
 	}
 }
 
+static int sqlite_sram_find_ui_slot()
+{
+	for (int i = 0; i < SQLITE_SRAM_MAX_SLOTS; i++)
+	{
+		if (!g_slots[i].enabled) continue;
+		if (!g_slots[i].db_path[0]) continue;
+		return i;
+	}
+	return -1;
+}
+
 #endif
 
 int sqlite_sram_runtime_enabled()
@@ -777,7 +975,7 @@ bool sqlite_sram_mount_virtual(uint8_t slot, const char *save_path, int pre_size
 
 	std::vector<uint8_t> latest;
 	bool found = false;
-	if (!sqlite_sram_load_latest(g_slots[slot].db_path, latest, &found))
+	if (!sqlite_sram_load_latest(g_slots[slot].db_path, pre_size, latest, &found))
 	{
 		fprintf(stderr, "SQLite SRAM warning: failed to load latest snapshot for \"%s\".\n", save_path);
 	}
@@ -895,5 +1093,240 @@ void sqlite_sram_poll()
 	if (!sqlite_sram_runtime_enabled()) return;
 	sqlite_sram_poll_export_trigger();
 	sqlite_sram_poll_flush();
+#endif
+}
+
+bool sqlite_sram_ui_available()
+{
+#if SQLITE_SRAM_SNAPSHOTS
+	if (!sqlite_sram_runtime_enabled()) return false;
+	return sqlite_sram_find_ui_slot() >= 0;
+#else
+	return false;
+#endif
+}
+
+bool sqlite_sram_tag_latest(const char *tag)
+{
+#if SQLITE_SRAM_SNAPSHOTS
+	if (!sqlite_sram_runtime_enabled() || !tag || !tag[0]) return false;
+
+	const int slot = sqlite_sram_find_ui_slot();
+	if (slot < 0) return false;
+
+	sqlite_sram_try_flush((uint8_t)slot);
+
+	sqlite3 *db = nullptr;
+	if (!sqlite_sram_open_db(g_slots[slot].db_path, &db)) return false;
+	if (!sqlite_sram_exec(db, "BEGIN IMMEDIATE;"))
+	{
+		sqlite3_close(db);
+		return false;
+	}
+
+	bool ok = false;
+	sqlite3_stmt *stmt = nullptr;
+	bool have_crc32 = false;
+	if (!sqlite_sram_column_exists(db, "snapshots", "crc32", &have_crc32))
+	{
+		sqlite_sram_exec(db, "ROLLBACK;");
+		sqlite3_close(db);
+		return false;
+	}
+
+	const char *tag_sql = have_crc32
+		? "INSERT INTO snapshots(ts_ms, crc32, sram, tag) SELECT ?, crc32, sram, ? FROM snapshots ORDER BY id DESC LIMIT 1;"
+		: "INSERT INTO snapshots(ts_ms, sram, tag) SELECT ?, sram, ? FROM snapshots ORDER BY id DESC LIMIT 1;";
+	if (sqlite3_prepare_v2(db, tag_sql, -1, &stmt, 0) == SQLITE_OK)
+	{
+		sqlite3_bind_int64(stmt, 1, sqlite_sram_timestamp_ms());
+		sqlite3_bind_text(stmt, 2, tag, -1, SQLITE_TRANSIENT);
+		ok = (sqlite3_step(stmt) == SQLITE_DONE) && (sqlite3_changes(db) > 0);
+		sqlite3_finalize(stmt);
+	}
+
+	if (ok) ok = sqlite_sram_exec(db, "COMMIT;");
+	if (!ok) sqlite_sram_exec(db, "ROLLBACK;");
+
+	sqlite3_close(db);
+	return ok;
+#else
+	(void)tag;
+	return false;
+#endif
+}
+
+int sqlite_sram_list_tagged(sram_store_tagged_snapshot_t *out, int max_items)
+{
+#if SQLITE_SRAM_SNAPSHOTS
+	if (!sqlite_sram_runtime_enabled() || !out || max_items <= 0) return 0;
+
+	const int slot = sqlite_sram_find_ui_slot();
+	if (slot < 0) return 0;
+
+	sqlite3 *db = nullptr;
+	if (!sqlite_sram_open_db(g_slots[slot].db_path, &db)) return 0;
+
+	int count = 0;
+	sqlite3_stmt *stmt = nullptr;
+
+	bool have_tombstones = false;
+	if (!sqlite_sram_table_exists(db, "snapshot_tombstones", &have_tombstones))
+	{
+		fprintf(stderr, "SQLite SRAM warning: failed to check tombstone table for tagged list, proceeding without tombstone filter.\n");
+		have_tombstones = false;
+	}
+
+	const char *list_sql = have_tombstones
+		? "SELECT id, ts_ms, tag FROM snapshots s WHERE tag IS NOT NULL AND tag <> '' AND NOT EXISTS (SELECT 1 FROM snapshot_tombstones t WHERE t.snapshot_id = s.id) ORDER BY id DESC LIMIT ?1;"
+		: "SELECT id, ts_ms, tag FROM snapshots WHERE tag IS NOT NULL AND tag <> '' ORDER BY id DESC LIMIT ?1;";
+	if (sqlite3_prepare_v2(db, list_sql, -1, &stmt, 0) == SQLITE_OK)
+	{
+		sqlite3_bind_int(stmt, 1, max_items);
+		while (count < max_items)
+		{
+			const int rc = sqlite3_step(stmt);
+			if (rc == SQLITE_DONE) break;
+			if (rc != SQLITE_ROW) break;
+
+			out[count].id = sqlite3_column_int64(stmt, 0);
+			out[count].ts_ms = sqlite3_column_int64(stmt, 1);
+			const unsigned char *tag = sqlite3_column_text(stmt, 2);
+			if (tag) snprintf(out[count].tag, sizeof(out[count].tag), "%s", (const char*)tag);
+			else out[count].tag[0] = 0;
+			count++;
+		}
+		sqlite3_finalize(stmt);
+	}
+
+	sqlite3_close(db);
+	return count;
+#else
+	(void)out;
+	(void)max_items;
+	return 0;
+#endif
+}
+
+bool sqlite_sram_restore_tagged(int64_t snapshot_id)
+{
+#if SQLITE_SRAM_SNAPSHOTS
+	if (!sqlite_sram_runtime_enabled()) return false;
+
+	const int slot = sqlite_sram_find_ui_slot();
+	if (slot < 0) return false;
+
+	sqlite3 *db = nullptr;
+	if (!sqlite_sram_open_db(g_slots[slot].db_path, &db)) return false;
+	if (!sqlite_sram_exec(db, "BEGIN IMMEDIATE;"))
+	{
+		sqlite3_close(db);
+		return false;
+	}
+
+	bool ok = false;
+	sqlite3_stmt *stmt = nullptr;
+	bool have_crc32 = false;
+	if (!sqlite_sram_column_exists(db, "snapshots", "crc32", &have_crc32))
+	{
+		sqlite_sram_exec(db, "ROLLBACK;");
+		sqlite3_close(db);
+		return false;
+	}
+
+	bool have_tombstones = false;
+	if (!sqlite_sram_table_exists(db, "snapshot_tombstones", &have_tombstones))
+	{
+		fprintf(stderr, "SQLite SRAM warning: failed to check tombstone table for tagged restore, proceeding without tombstone filter.\n");
+		have_tombstones = false;
+	}
+
+	const char *restore_sql = nullptr;
+	if (have_crc32)
+	{
+		restore_sql = have_tombstones
+			? "INSERT INTO snapshots(ts_ms, crc32, sram, tag) SELECT ?1, crc32, sram, NULL FROM snapshots s WHERE id = ?2 AND tag IS NOT NULL AND NOT EXISTS (SELECT 1 FROM snapshot_tombstones t WHERE t.snapshot_id = s.id) LIMIT 1;"
+			: "INSERT INTO snapshots(ts_ms, crc32, sram, tag) SELECT ?1, crc32, sram, NULL FROM snapshots WHERE id = ?2 AND tag IS NOT NULL LIMIT 1;";
+	}
+	else
+	{
+		restore_sql = have_tombstones
+			? "INSERT INTO snapshots(ts_ms, sram, tag) SELECT ?1, sram, NULL FROM snapshots s WHERE id = ?2 AND tag IS NOT NULL AND NOT EXISTS (SELECT 1 FROM snapshot_tombstones t WHERE t.snapshot_id = s.id) LIMIT 1;"
+			: "INSERT INTO snapshots(ts_ms, sram, tag) SELECT ?1, sram, NULL FROM snapshots WHERE id = ?2 AND tag IS NOT NULL LIMIT 1;";
+	}
+	if (sqlite3_prepare_v2(db, restore_sql, -1, &stmt, 0) == SQLITE_OK)
+	{
+		sqlite3_bind_int64(stmt, 1, sqlite_sram_timestamp_ms());
+		sqlite3_bind_int64(stmt, 2, snapshot_id);
+		ok = (sqlite3_step(stmt) == SQLITE_DONE) && (sqlite3_changes(db) > 0);
+		sqlite3_finalize(stmt);
+	}
+
+	if (ok) ok = sqlite_sram_exec(db, "COMMIT;");
+	if (!ok) sqlite_sram_exec(db, "ROLLBACK;");
+
+	sqlite3_close(db);
+	return ok;
+#else
+	(void)snapshot_id;
+	return false;
+#endif
+}
+
+bool sqlite_sram_delete_tagged(int64_t snapshot_id)
+{
+#if SQLITE_SRAM_SNAPSHOTS
+	if (!sqlite_sram_runtime_enabled()) return false;
+
+	const int slot = sqlite_sram_find_ui_slot();
+	if (slot < 0) return false;
+
+	sqlite3 *db = nullptr;
+	if (!sqlite_sram_open_db(g_slots[slot].db_path, &db)) return false;
+	if (!sqlite_sram_exec(db, "BEGIN IMMEDIATE;"))
+	{
+		sqlite3_close(db);
+		return false;
+	}
+
+	bool ok = false;
+	sqlite3_stmt *stmt = nullptr;
+
+	bool have_tombstones = false;
+	if (!sqlite_sram_table_exists(db, "snapshot_tombstones", &have_tombstones))
+	{
+		fprintf(stderr, "SQLite SRAM warning: tombstone table missing; cannot delete tagged snapshot yet.\n");
+		have_tombstones = false;
+	}
+
+	if (have_tombstones && sqlite3_prepare_v2(db, "INSERT OR IGNORE INTO snapshot_tombstones(snapshot_id, ts_ms) SELECT id, ?1 FROM snapshots WHERE id = ?2 AND tag IS NOT NULL LIMIT 1;", -1, &stmt, 0) == SQLITE_OK)
+	{
+		sqlite3_bind_int64(stmt, 1, sqlite_sram_timestamp_ms());
+		sqlite3_bind_int64(stmt, 2, snapshot_id);
+		ok = (sqlite3_step(stmt) == SQLITE_DONE);
+		sqlite3_finalize(stmt);
+	}
+
+	if (ok)
+	{
+		stmt = nullptr;
+		bool exists = false;
+		if (sqlite3_prepare_v2(db, "SELECT 1 FROM snapshot_tombstones WHERE snapshot_id = ?1 LIMIT 1;", -1, &stmt, 0) == SQLITE_OK)
+		{
+			sqlite3_bind_int64(stmt, 1, snapshot_id);
+			exists = (sqlite3_step(stmt) == SQLITE_ROW);
+			sqlite3_finalize(stmt);
+		}
+		ok = exists;
+	}
+
+	if (ok) ok = sqlite_sram_exec(db, "COMMIT;");
+	if (!ok) sqlite_sram_exec(db, "ROLLBACK;");
+
+	sqlite3_close(db);
+	return ok;
+#else
+	(void)snapshot_id;
+	return false;
 #endif
 }
